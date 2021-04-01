@@ -1,0 +1,162 @@
+#!/bin/sh
+
+# open cluster management (ocm) hub and managed minikube kvm amd64 clusters deploy
+# https://github.com/ShyamsundarR/ocm-minikube/README.md
+
+set -x
+#set -e
+
+# minikube not installed?
+if ! command -v minikube; then
+	# https://minikube.sigs.k8s.io/docs/start/
+	# minikube-linux-amd64 download and install
+	curl -Lo minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+	chmod +x minikube
+	mkdir -p ${HOME}/.local/bin
+	mv minikube ${HOME}/.local/bin/
+fi
+
+minikube_driver_name=kvm2
+
+# kvm not installed?
+#if
+	# https://minikube.sigs.k8s.io/docs/drivers/kvm2/
+	# https://access.redhat.com/articles/1344173#Q_how-install-virtualization-packages
+	# yum install libvirt -y
+	# sudo usermod -aG libvirt ${LOGNAME}
+	# groups refresh
+	# su - ${LOGNAME}
+#fi
+
+# ocm hub cluster deploy
+minikube start --driver=${minikube_driver_name} --profile=hub --cpus=4
+
+# kubectl alias (re)define
+#alias kubectl=minikube\ kubectl\ --
+
+# kubectl not installed?
+# TODO or less than version 1.11 (wait unsupported)
+if ! command -v kubectl; then
+	# https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/#install-kubectl-binary-with-curl-on-linux
+	curl -LO https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+	chmod +x kubectl
+	mkdir -p ${HOME}/.local/bin
+	mv kubectl ${HOME}/.local/bin/
+fi
+
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/cluster-registry/master/cluster-registry-crd.yaml
+git clone https://github.com/open-cluster-management/registration-operator.git
+git clone https://github.com/ShyamsundarR/ocm-minikube.git
+# registration-operator make deploy-hub requires go version 1.14.4 or greater
+	# https://golang.org/ref/mod#versions
+	# https://semver.org/spec/v2.0.0.html
+# go not installed?
+# TODO or version less than 1.14.4?
+if ! command -v go; then
+	PATH=${HOME}/.local/go/bin:${PATH}
+	if ! command -v go; then
+		mkdir -p ${HOME}/.local
+		cd ${HOME}/.local
+		curl -L https://golang.org/dl/go1.16.2.linux-amd64.tar.gz | tar -xz
+		cd -
+	fi
+fi
+cd ./registration-operator
+git apply ../ocm-minikube/registration-operator.diff
+make deploy-hub
+kubectl wait pods --all --for=condition=Ready -n olm || exit $?
+kubectl wait pods --all --for=condition=Ready -n open-cluster-management || exit $?
+kubectl wait pods --all --for=condition=Ready -n open-cluster-management-hub || exit $?
+
+# managed cluster deploy
+minikube start --driver=${minikube_driver_name} --profile=cluster1
+kubectl config view --flatten --context=hub --minify > /tmp/hub-config
+kubectl config view --flatten --context=cluster1 --minify > /tmp/cluster1-config # TODO remove
+kubectl config use-context cluster1
+export KLUSTERLET_KIND_KUBECONFIG=/tmp/cluster1-config # TODO remove
+export KIND_CLUSTER=cluster1 # TODO remove
+export MANAGED_CLUSTER=cluster1
+export HUB_KIND_KUBECONFIG=/tmp/hub-config
+make deploy-spoke-kind
+kubectl wait deployments --all --for=condition=Available -n open-cluster-management || exit $?
+# TODO agent deployment failure debug
+kubectl wait deployments --all --for=condition=Available -n open-cluster-management-agent || exit $?
+
+:<<'!'
+# hub register managed cluster
+kubectl config use-context hub
+# kubectl get csr
+kubectl get csr --field-selector=signername=kubernetes.io/kube-apiserver-client 
+kubectl get csr -lapp=mc-daemon --field-selector=status.phase=Running -ojsonpath={.items[0].metadata.name}
+kubectl wait csr --selector signername=kubernetes.io/kube-apiserver-client --for=condition=Pending
+kubectl wait csr --selector signername=kubernetes.io/kube-apiserver-client-kubelet --for=condition=Approved,Issued
+kubectl certificate approve cluster1-2bcsp
+kubectl get csr
+kubectl get managedcluster
+kubectl patch managedcluster cluster1 -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
+kubectl get managedcluster
+
+# test
+kubectl config use-context hub
+sed -e "s,KIND_CLUSTER,$KIND_CLUSTER," -i ../ocm-minikube/examples/kustomization.yaml
+kubectl apply -k ../ocm-minikube/examples/
+sed -e "s,$KIND_CLUSTER,KIND_CLUSTER," -i ../ocm-minikube/examples/kustomization.yaml
+
+# hub subscription operator
+git clone git@github.com:open-cluster-management/multicloud-operators-subscription.git
+cd multicloud-operators-subscription
+git apply ../ocm-minikube/multicloud-operators-subscription.diff
+kubectl config use-context hub
+USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-hub
+
+# deployments wait
+kubectl get deployments -n multicluster-operators
+
+# hub managed cluster subscription operator
+kubectl config use-context hub
+kubectl get managedcluster hub
+export MANAGED_CLUSTER_NAME=hub
+kubectl patch managedcluster ${MANAGED_CLUSTER_NAME} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
+
+cd ../multicloud-operators-subscription
+
+export HUB_KUBECONFIG=/tmp/hub-config
+cp -f ${HUB_KUBECONFIG} /tmp/kubeconfig
+kubectl -n multicluster-operators create secret generic appmgr-hub-kubeconfig --from-file=kubeconfig=/tmp/kubeconfig
+mkdir -p munge-manifests
+cp deploy/managed/operator.yaml munge-manifests/operator.yaml
+sed -i 's/<managed cluster name>/'"$MANAGED_CLUSTER_NAME"'/g' munge-manifests/operator.yaml
+sed -i 's/<managed cluster namespace>/'"$MANAGED_CLUSTER_NAME"'/g' munge-manifests/operator.yaml
+sed -i '0,/name: multicluster-operators-subscription/{s/name: multicluster-operators-subscription/name: multicluster-operators-subscription-mc/}' munge-manifests/operator.yaml
+kubectl apply -f munge-manifests/operator.yaml
+
+# deployments wait
+kubectl get deployments -n multicluster-operators
+
+# managed cluster subscription operator
+export HUB_KUBECONFIG=/tmp/hub-config
+kubectl config use-context cluster1
+export MANAGED_CLUSTER_NAME=cluster1
+USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-managed
+
+# deployments wait
+kubectl get deployments -n multicluster-operators
+
+# test
+kubectl config use-context hub
+kubectl apply -f examples/helmrepo-hub-channel
+kubectl get pods --context=cluster1
+
+kubectl patch managedcluster cluster1 -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
+git clone git@github.com:open-cluster-management/application-samples.git
+cd application-samples
+git apply ../ocm-minikube/application-samples.diff
+kubectl apply -k subscriptions/channel
+kubectl apply -k subscriptions/book-import
+kubectl apply -f subscriptions/book-import/application.yaml 
+kubectl get pods --context=cluster1 -n book-import
+!
+
+# kubectl alias undefine
+#unalias kubectl
+unset -v minikube_driver_name
