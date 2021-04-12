@@ -4,7 +4,8 @@
 # https://github.com/ShyamsundarR/ocm-minikube/README.md
 
 set -x
-#set -e
+set -e
+trap 'echo "return value: $?"' EXIT
 
 # minikube not installed?
 if ! command -v minikube; then
@@ -45,8 +46,10 @@ if ! command -v kubectl; then
 fi
 
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/cluster-registry/master/cluster-registry-crd.yaml
+set +e
 git clone https://github.com/open-cluster-management/registration-operator.git
 git clone https://github.com/ShyamsundarR/ocm-minikube.git
+set -e
 # registration-operator make deploy-hub requires go version 1.14.4 or greater
 	# https://golang.org/ref/mod#versions
 	# https://semver.org/spec/v2.0.0.html
@@ -62,11 +65,21 @@ if ! command -v go; then
 	fi
 fi
 cd ./registration-operator
-git apply ../ocm-minikube/registration-operator.diff
+git checkout master
+# TODO managed cluster names other than cluster1 require
+# git apply ../ocm-minikube/registration-operator.diff
+set +e
 make deploy-hub
-kubectl wait pods --all --for=condition=Ready -n olm || exit $?
-kubectl wait pods --all --for=condition=Ready -n open-cluster-management || exit $?
-kubectl wait pods --all --for=condition=Ready -n open-cluster-management-hub || exit $?
+set -e
+kubectl wait deployments --all --for condition=Available -n olm --timeout 1m
+kubectl wait deployments --all --for condition=Available -n open-cluster-management
+# https://github.com/kubernetes/kubernetes/issues/83242
+i=0; while
+! kubectl get deployments -n open-cluster-management-hub --field-selector metadata.name=cluster-manager-registration-controller -ojsonpath={.items[0].status.availableReplicas} ||\
+! kubectl get deployments -n open-cluster-management-hub --field-selector metadata.name=cluster-manager-registration-webhook    -ojsonpath={.items[0].status.availableReplicas} ||\
+! kubectl get deployments -n open-cluster-management-hub --field-selector metadata.name=cluster-manager-work-webhook            -ojsonpath={.items[0].status.availableReplicas} &&\
+test $i -lt 90; do sleep 1; i=$((i+1)); done; unset -v i
+kubectl wait deployments --all --for condition=Available -n open-cluster-management-hub --timeout 2m
 
 # managed cluster deploy
 minikube start --driver=${minikube_driver_name} --profile=cluster1
@@ -75,26 +88,29 @@ kubectl config view --flatten --context=cluster1 --minify > /tmp/cluster1-config
 kubectl config use-context cluster1
 export KLUSTERLET_KIND_KUBECONFIG=/tmp/cluster1-config # TODO remove
 export KIND_CLUSTER=cluster1 # TODO remove
-export MANAGED_CLUSTER=cluster1
+#export MANAGED_CLUSTER=cluster1
 export HUB_KIND_KUBECONFIG=/tmp/hub-config
+set +e
 make deploy-spoke-kind
-kubectl wait deployments --all --for=condition=Available -n open-cluster-management || exit $?
-# TODO agent deployment failure debug
-kubectl wait deployments --all --for=condition=Available -n open-cluster-management-agent || exit $?
+set -e
+kubectl config current-context
+kubectl wait deployments --all --for condition=Available -n open-cluster-management
+date
+# https://github.com/kubernetes/kubernetes/issues/83242
+i=0; while
+! kubectl get deployments -n open-cluster-management-agent --field-selector metadata.name=klusterlet-registration-agent -ojsonpath={.items[0].status.availableReplicas} ||\
+! kubectl get deployments -n open-cluster-management-agent --field-selector metadata.name=klusterlet-work-agent         -ojsonpath={.items[0].status.availableReplicas} &&\
+test $i -lt 60; do sleep 1; i=$((i+1)); done; unset -v i
+kubectl wait deployments --all --for condition=Available -n open-cluster-management-agent
 
-:<<'!'
 # hub register managed cluster
 kubectl config use-context hub
-# kubectl get csr
-kubectl get csr --field-selector=signername=kubernetes.io/kube-apiserver-client 
-kubectl get csr -lapp=mc-daemon --field-selector=status.phase=Running -ojsonpath={.items[0].metadata.name}
-kubectl wait csr --selector signername=kubernetes.io/kube-apiserver-client --for=condition=Pending
-kubectl wait csr --selector signername=kubernetes.io/kube-apiserver-client-kubelet --for=condition=Approved,Issued
-kubectl certificate approve cluster1-2bcsp
-kubectl get csr
-kubectl get managedcluster
+kubectl wait csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --for condition=Pending
+kubectl wait csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client-kubelet --for condition=Approved,Issued
+kubectl certificate approve $(kubectl get csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client -ojsonpath={.items[0].metadata.name})
+kubectl wait csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --for condition=Approved,Issued
 kubectl patch managedcluster cluster1 -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
-kubectl get managedcluster
+kubectl wait managedcluster --all --for condition=Available=true
 
 # test
 kubectl config use-context hub
@@ -102,6 +118,7 @@ sed -e "s,KIND_CLUSTER,$KIND_CLUSTER," -i ../ocm-minikube/examples/kustomization
 kubectl apply -k ../ocm-minikube/examples/
 sed -e "s,$KIND_CLUSTER,KIND_CLUSTER," -i ../ocm-minikube/examples/kustomization.yaml
 
+:<<'!'
 # hub subscription operator
 git clone git@github.com:open-cluster-management/multicloud-operators-subscription.git
 cd multicloud-operators-subscription
@@ -157,6 +174,8 @@ kubectl apply -f subscriptions/book-import/application.yaml
 kubectl get pods --context=cluster1 -n book-import
 !
 
+#minikube delete -p cluster1
+#minikube delete -p hub
 # kubectl alias undefine
 #unalias kubectl
 unset -v minikube_driver_name
