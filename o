@@ -5,7 +5,10 @@
 
 set -x
 set -e
-trap 'echo "return value: $?"' EXIT
+trap 'echo exit value: $?' EXIT
+
+#minikube delete -p hub
+#minikube delete -p cluster1
 
 mkdir -p ${HOME}/.local/bin
 PATH=${HOME}/.local/bin:${PATH}
@@ -31,7 +34,7 @@ if ! command -v minikube; then
 	cd -
 fi
 
-minikube_start_options=--driver=kvm2 #\ --network=default
+minikube_start_options=--driver=kvm2
 . /etc/os-release # NAME
 
 # kvm not installed?
@@ -81,8 +84,8 @@ fi
 
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/cluster-registry/master/cluster-registry-crd.yaml
 set +e
-git clone https://github.com/open-cluster-management/registration-operator.git
-git clone https://github.com/ShyamsundarR/ocm-minikube.git
+git clone https://github.com/open-cluster-management/registration-operator
+git clone https://github.com/ShyamsundarR/ocm-minikube
 set -e
 # registration-operator make deploy-hub requires go version 1.14.4 or greater
 	# https://golang.org/ref/mod#versions
@@ -106,78 +109,101 @@ then
 fi
 cd ./registration-operator
 git checkout release-2.3
-# TODO managed cluster names other than cluster1 require
-#git apply ../ocm-minikube/registration-operator.diff
+# managed cluster names other than cluster1 require
+set +e
+git apply ../ocm-minikube/registration-operator.diff
+set -e
 set +e
 make deploy-hub ${deploy_arguments}
 set -e
-kubectl wait deployments --all --for condition=Available -n olm --timeout 1m
-kubectl wait deployments --all --for condition=Available -n open-cluster-management
-# https://github.com/kubernetes/kubernetes/issues/83242
-i=0; while
-! kubectl get deployments -n open-cluster-management-hub --field-selector metadata.name=cluster-manager-registration-controller -ojsonpath={.items[0].status.availableReplicas} 2>/dev/null ||\
-! kubectl get deployments -n open-cluster-management-hub --field-selector metadata.name=cluster-manager-registration-webhook    -ojsonpath={.items[0].status.availableReplicas} 2>/dev/null ||\
-! kubectl get deployments -n open-cluster-management-hub --field-selector metadata.name=cluster-manager-work-webhook            -ojsonpath={.items[0].status.availableReplicas} 2>/dev/null &&\
-test $i -lt 90; do sleep 1; i=$((i+1)); done; unset -v i
-kubectl wait deployments --all --for condition=Available -n open-cluster-management-hub --timeout 2m
-
-# managed cluster deploy
-minikube start ${minikube_start_options} --profile=cluster1 #--network=mk-hub
-unset -v minikube_start_options
-kubectl config view --flatten --context=hub --minify >/tmp/hub-config
-#kubectl config use-context cluster1
-#export KLUSTERLET_KIND_KUBECONFIG=/tmp/cluster1-config # TODO remove
-#export KIND_CLUSTER=cluster1 # TODO remove
-#export MANAGED_CLUSTER=cluster1
-#export HUB_KIND_KUBECONFIG=/tmp/hub-config
-#export KUBECONFIG=/tmp/hub-config
-export HUB_KUBECONFIG=/tmp/hub-config
-set +e
-make deploy-spoke ${deploy_arguments}
-set -e
-unset -v deploy_arguments
-kubectl config current-context
-kubectl wait deployments --all --for condition=Available -n open-cluster-management
+cd ../
 date
+kubectl --context hub -n olm                     wait deployments --all --for condition=available --timeout 1m
+date
+kubectl --context hub -n open-cluster-management wait deployments --all --for condition=available
 # https://github.com/kubernetes/kubernetes/issues/83242
 i=0; while
-! kubectl get deployments -n open-cluster-management-agent --field-selector metadata.name=klusterlet-registration-agent -ojsonpath={.items[0].status.availableReplicas} 2>/dev/null ||\
-! kubectl get deployments -n open-cluster-management-agent --field-selector metadata.name=klusterlet-work-agent         -ojsonpath={.items[0].status.availableReplicas} 2>/dev/null &&\
-test $i -lt 60; do sleep 1; i=$((i+1)); done; unset -v i
-kubectl wait deployments --all --for condition=Available -n open-cluster-management-agent
+! kubectl --context hub -n open-cluster-management-hub get deployments/cluster-manager-registration-controller --ignore-not-found=false >/dev/null 2>&1 ||\
+! kubectl --context hub -n open-cluster-management-hub get deployments/cluster-manager-registration-webhook    --ignore-not-found=false >/dev/null 2>&1 ||\
+! kubectl --context hub -n open-cluster-management-hub get deployments/cluster-manager-work-webhook            --ignore-not-found=false >/dev/null 2>&1 &&\
+test $i -lt 90; do sleep 1; i=$((i+1)); done; unset -v i
+date
+kubectl --context hub -n open-cluster-management-hub wait deployments --all --for condition=available --timeout 2m
+date
 
-:<<'!'
-# hub register managed cluster
-kubectl config use-context hub
-kubectl wait csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --for condition=condition=Pending
-kubectl wait csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client-kubelet --for condition=condition=Approved,Issued
-kubectl certificate approve $(kubectl get csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client -ojsonpath={.items[0].metadata.name})
-kubectl wait csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --for condition=Approved,Issued
-kubectl patch managedcluster cluster1 -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
-kubectl wait managedcluster --all --for condition=Available=true
+# managed cluster1 deploy
+minikube start ${minikube_start_options} --profile=cluster1
+unset -v minikube_start_options
 
-# test
-kubectl config use-context hub
-sed -e "s,KIND_CLUSTER,$KIND_CLUSTER," -i ../ocm-minikube/examples/kustomization.yaml
-kubectl apply -k ../ocm-minikube/examples/
-sed -e "s,$KIND_CLUSTER,KIND_CLUSTER," -i ../ocm-minikube/examples/kustomization.yaml
+kubectl --context hub config view --flatten --minify >/tmp/hub-config
+
+spoke_add()
+{
+	cluster_name=${1}
+	cd ./registration-operator
+	export MANAGED_CLUSTER=${cluster_name}
+	#export KUBECONFIG=/tmp/hub-config
+	export HUB_KUBECONFIG=/tmp/hub-config
+	kubectl config use-context ${cluster_name}
+	set +e
+	make deploy-spoke ${deploy_arguments}
+	set -e
+	cd ../
+
+	kubectl --context ${cluster_name} -n open-cluster-management wait deployments --all --for condition=available
+	date
+	# https://github.com/kubernetes/kubernetes/issues/83242
+	i=0; while
+	! kubectl --context ${cluster_name} -n open-cluster-management-agent get deployments/klusterlet-registration-agent --ignore-not-found=false >/dev/null 2>&1 \
+	&& test $i -lt 60; do sleep 1; i=$((i+1)); done; unset -v i
+	#! kubectl --context ${cluster_name} -n open-cluster-management-agent get deployments/klusterlet-work-agent         -oname  >/dev/null 2>&1 &&\
+	kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments/klusterlet-registration-agent --for condition=available
+
+	# hub register managed cluster
+	set +e
+	kubectl --context hub certificate approve $(kubectl --context hub get csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --selector open-cluster-management.io/cluster-name=${cluster_name} -oname)
+	set -e
+	#kubectl wait csr ${csr_name} --for condition=approved
+	kubectl --context hub patch managedcluster ${cluster_name} -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
+	kubectl --context hub wait managedcluster/${cluster_name} --for condition=ManagedClusterConditionAvailable
+	kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments --all --for condition=available
+
+	# test
+	sed -e "s,KIND_CLUSTER,${cluster_name}," -i ./ocm-minikube/examples/kustomization.yaml
+	set +e
+	kubectl --context hub apply -k ./ocm-minikube/examples/
+	set -e
+	sed -e "s,${cluster_name},KIND_CLUSTER," -i ./ocm-minikube/examples/kustomization.yaml
+	unset -v cluster_name
+}
+spoke_add cluster1
 
 # hub subscription operator
-git clone git@github.com:open-cluster-management/multicloud-operators-subscription.git
-cd multicloud-operators-subscription
+set +e
+git clone https://github.com/open-cluster-management/multicloud-operators-subscription
+set -e
+cd ./multicloud-operators-subscription
+set +e
 git apply ../ocm-minikube/multicloud-operators-subscription.diff
+set -e
 kubectl config use-context hub
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-hub
+cd ../
 
 # deployments wait
-kubectl get deployments -n multicluster-operators
+kubectl --context hub -n multicluster-operators wait deployments --all --for condition=available --timeout 2m
+
+spoke_add hub
+unset -v deploy_arguments
+
+:<<'!'
 
 # hub managed cluster subscription operator
-kubectl config use-context hub
-kubectl get managedcluster hub
+# kubectl --context hub get managedcluster hub
 export MANAGED_CLUSTER_NAME=hub
-kubectl patch managedcluster ${MANAGED_CLUSTER_NAME} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
+kubectl --context hub patch managedcluster ${MANAGED_CLUSTER_NAME} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
 
+# kubectl config use-context hub
 cd ../multicloud-operators-subscription
 
 export HUB_KUBECONFIG=/tmp/hub-config
@@ -195,8 +221,8 @@ kubectl get deployments -n multicluster-operators
 
 # managed cluster subscription operator
 export HUB_KUBECONFIG=/tmp/hub-config
-kubectl config use-context cluster1
-export MANAGED_CLUSTER_NAME=cluster1
+kubectl config use-context ${cluster_name}
+export MANAGED_CLUSTER_NAME=${cluster_name}
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-managed
 
 # deployments wait
@@ -205,19 +231,18 @@ kubectl get deployments -n multicluster-operators
 # test
 kubectl config use-context hub
 kubectl apply -f examples/helmrepo-hub-channel
-kubectl get pods --context=cluster1
+kubectl get pods --context=${cluster_name}
 
-kubectl patch managedcluster cluster1 -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
+kubectl patch managedcluster ${cluster_name} -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
 git clone git@github.com:open-cluster-management/application-samples.git
 cd application-samples
 git apply ../ocm-minikube/application-samples.diff
 kubectl apply -k subscriptions/channel
 kubectl apply -k subscriptions/book-import
 kubectl apply -f subscriptions/book-import/application.yaml 
-kubectl get pods --context=cluster1 -n book-import
+kubectl get pods --context=${cluster_name} -n book-import
 !
 
-#minikube delete -p cluster1
-#minikube delete -p hub
+
 # kubectl alias undefine
 #unalias kubectl
