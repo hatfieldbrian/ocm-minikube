@@ -63,9 +63,6 @@ fi
 # ocm hub cluster deploy
 minikube start ${minikube_start_options} --profile=hub --cpus=4
 
-# kubectl alias (re)define
-#alias kubectl=minikube\ kubectl\ --
-
 # kubectl not installed?
 # TODO or less than version 1.11 (wait unsupported)
 if ! command -v kubectl; then
@@ -190,59 +187,63 @@ kubectl config use-context hub
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-hub
 cd ../
 
-# deployments wait
 kubectl --context hub -n multicluster-operators wait deployments --all --for condition=available --timeout 2m
 
-spoke_add hub
+spoke_add_hub()
+{
+	spoke_add ${1}
+	kubectl --context hub patch managedcluster ${1} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
+}
+spoke_add_hub hub
 unset -v deploy_arguments
 
-:<<'!'
-
 # hub managed cluster subscription operator
-# kubectl --context hub get managedcluster hub
 export MANAGED_CLUSTER_NAME=hub
-kubectl --context hub patch managedcluster ${MANAGED_CLUSTER_NAME} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
-
 # kubectl config use-context hub
-cd ../multicloud-operators-subscription
-
+cd multicloud-operators-subscription
 export HUB_KUBECONFIG=/tmp/hub-config
 cp -f ${HUB_KUBECONFIG} /tmp/kubeconfig
-kubectl -n multicluster-operators create secret generic appmgr-hub-kubeconfig --from-file=kubeconfig=/tmp/kubeconfig
+set +e
+kubectl --context hub -n multicluster-operators create secret generic appmgr-hub-kubeconfig --from-file=kubeconfig=/tmp/kubeconfig
+set -e
 mkdir -p munge-manifests
 cp deploy/managed/operator.yaml munge-manifests/operator.yaml
 sed -i 's/<managed cluster name>/'"$MANAGED_CLUSTER_NAME"'/g' munge-manifests/operator.yaml
 sed -i 's/<managed cluster namespace>/'"$MANAGED_CLUSTER_NAME"'/g' munge-manifests/operator.yaml
 sed -i '0,/name: multicluster-operators-subscription/{s/name: multicluster-operators-subscription/name: multicluster-operators-subscription-mc/}' munge-manifests/operator.yaml
-kubectl apply -f munge-manifests/operator.yaml
+kubectl --context hub apply -f munge-manifests/operator.yaml
+kubectl --context hub -n multicluster-operators wait deployments --all --for condition=available
 
-# deployments wait
-kubectl get deployments -n multicluster-operators
-
+cluster_name=cluster1
 # managed cluster subscription operator
-export HUB_KUBECONFIG=/tmp/hub-config
+# export HUB_KUBECONFIG=/tmp/hub-config
 kubectl config use-context ${cluster_name}
 export MANAGED_CLUSTER_NAME=${cluster_name}
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-managed
-
-# deployments wait
-kubectl get deployments -n multicluster-operators
+kubectl --context ${cluster_name} -n multicluster-operators wait deployments --all --for condition=available
 
 # test
-kubectl config use-context hub
-kubectl apply -f examples/helmrepo-hub-channel
-kubectl get pods --context=${cluster_name}
+kubectl --context hub apply -f examples/helmrepo-hub-channel
+kubectl --context ${cluster_name} wait deployments --all --for condition=available
+cd ..
 
-kubectl patch managedcluster ${cluster_name} -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
-git clone git@github.com:open-cluster-management/application-samples.git
+#
+kubectl --context hub patch managedcluster ${cluster_name} -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
+set +e
+git clone https://github.com/open-cluster-management/application-samples
+set -e
 cd application-samples
+set +e
 git apply ../ocm-minikube/application-samples.diff
-kubectl apply -k subscriptions/channel
-kubectl apply -k subscriptions/book-import
-kubectl apply -f subscriptions/book-import/application.yaml 
-kubectl get pods --context=${cluster_name} -n book-import
-!
-
-
-# kubectl alias undefine
-#unalias kubectl
+set -e
+kubectl --context hub apply -k subscriptions/channel
+set +e
+# Error from server (InternalError): error when creating "subscriptions/book-import": Internal error occurred: failed calling webhook "applications.apps.open-cluster-management.webhook": Post "https://multicluster-operators-application-svc.multicluster-operators.svc:443/app-validate?timeout=10s": dial tcp 10.106.210.84:443: connect: connection refused
+kubectl --context hub apply -k subscriptions/book-import
+# Error from server (InternalError): error when creating "subscriptions/book-import/application.yaml": Internal error occurred: failed calling webhook "applications.apps.open-cluster-management.webhook": Post "https://multicluster-operators-application-svc.multicluster-operators.svc:443/app-validate?timeout=10s": dial tcp 10.106.210.84:443: connect: connection refused
+kubectl --context hub apply -f subscriptions/book-import/application.yaml 
+set -e
+# https://github.com/kubernetes/kubernetes/issues/83242
+i=0; while ! kubectl --context ${cluster_name} -n book-import get deployments --ignore-not-found=false >/dev/null 2>&1 && test $i -lt 30; do sleep 1; i=$((i+1)); done; unset -v i
+kubectl --context ${cluster_name} -n book-import wait deployments --all --for condition=available
+unset -v cluster_name
