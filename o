@@ -7,8 +7,8 @@ set -x
 set -e
 trap 'echo exit value: $?' EXIT
 
-#minikube delete -p hub
 #minikube delete -p cluster1
+#minikube delete -p hub
 
 mkdir -p ${HOME}/.local/bin
 PATH=${HOME}/.local/bin:${PATH}
@@ -82,7 +82,9 @@ fi
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/cluster-registry/master/cluster-registry-crd.yaml
 set +e
 git clone https://github.com/open-cluster-management/registration-operator
+# fatal: destination path 'registration-operator' already exists and is not an empty directory.
 git clone https://github.com/ShyamsundarR/ocm-minikube
+# fatal: destination path 'ocm-minikube' already exists and is not an empty directory.
 set -e
 # registration-operator make deploy-hub requires go version 1.14.4 or greater
 	# https://golang.org/ref/mod#versions
@@ -109,6 +111,8 @@ git checkout release-2.3
 # managed cluster names other than cluster1 require
 set +e
 git apply ../ocm-minikube/registration-operator.diff
+# error: patch failed: Makefile:36
+# error: Makefile: patch does not apply
 set -e
 set +e
 make deploy-hub ${deploy_arguments}
@@ -123,7 +127,6 @@ expected if restart:
 FATA[0000] Failed to run packagemanifests: create catalog: error creating catalog source: catalogsources.operators.coreos.com "cluster-manager-catalog" already exists
 Makefile:112: recipe for target 'deploy-hub-operator' failed
 make: *** [deploy-hub-operator] Error 1
-
 !
 set -e
 cd ..
@@ -137,7 +140,6 @@ i=0; while ! kubectl --context hub -n open-cluster-management-hub wait deploymen
 
 # managed cluster1 deploy
 minikube start ${minikube_start_options} --profile=cluster1
-unset -v minikube_start_options
 
 kubectl --context hub config view --flatten --minify >/tmp/hub-config
 
@@ -161,13 +163,14 @@ spoke_add()
 	i=0; while ! kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments/klusterlet-registration-agent --for condition=available --timeout 0; do test $i -lt 60; sleep 1; i=$((i+1)); done; unset -v i
 
 	# hub register managed cluster
+	i=0; while ! kubectl --context hub get managedclusters/${cluster_name} --ignore-not-found=false; do test $i -lt 30; sleep 1; i=$((i+1)); done; unset -v i
 	set +e
 	kubectl --context hub certificate approve $(kubectl --context hub get csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --selector open-cluster-management.io/cluster-name=${cluster_name} -oname)
 	# error: one or more CSRs must be specified as <name> or -f <filename>
 	set -e
-	kubectl --context hub patch managedcluster ${cluster_name} -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
+	kubectl --context hub patch managedclusters/${cluster_name} -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
 	date
-	kubectl --context hub wait managedcluster/${cluster_name} --for condition=ManagedClusterConditionAvailable
+	kubectl --context hub wait managedclusters/${cluster_name} --for condition=ManagedClusterConditionAvailable
 	date
 	kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments --all --for condition=available
 	date
@@ -176,11 +179,9 @@ spoke_add()
 	mkdir -p /tmp/ocm-minikube
 	cp -R ocm-minikube/examples /tmp/ocm-minikube
 	sed -e "s,KIND_CLUSTER,${cluster_name}," -i /tmp/ocm-minikube/examples/kustomization.yaml
-	set +e
 	kubectl --context hub apply -k /tmp/ocm-minikube/examples
-	set -e
 	date
-	kubectl --context ${cluster_name} wait pods/hello --for condition=ready --timeout 90s
+	i=0; while ! kubectl --context ${cluster_name} wait pods/hello --for condition=ready --timeout 0; do test $i -lt 120; sleep 1; i=$((i+1)); done; unset -v i
 	date
 	# delete may take more than 30 seconds
 	kubectl --context hub delete -k /tmp/ocm-minikube/examples --wait=false
@@ -199,10 +200,13 @@ spoke_add cluster1
 # hub subscription operator
 set +e
 git clone https://github.com/open-cluster-management/multicloud-operators-subscription
+# fatal: destination path 'multicloud-operators-subscription' already exists and is not an empty directory.
 set -e
 cd multicloud-operators-subscription
 set +e
 git apply ../ocm-minikube/multicloud-operators-subscription.diff
+# error: patch failed: Makefile:209
+# error: Makefile: patch does not apply
 set -e
 kubectl config use-context hub
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-hub
@@ -215,9 +219,15 @@ date
 spoke_add_hub()
 {
 	spoke_add ${1}
-	kubectl --context hub patch managedcluster ${1} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
+	kubectl --context hub patch managedclusters/${1} -p='{"metadata":{"labels":{"local-cluster":"true"}}}' --type=merge
 }
+if true; then
 spoke_add_hub hub
+else
+minikube start ${minikube_start_options} --profile=cluster2
+unset -v minikube_start_options
+spoke_add cluster2
+fi
 unset -v deploy_arguments
 
 # hub managed cluster subscription operator
@@ -251,13 +261,13 @@ kubectl --context ${cluster_name} -n multicluster-operators wait deployments --a
 date
 
 # test
-kubectl config use-context hub
 kubectl --context hub apply -f examples/helmrepo-hub-channel
 # https://github.com/kubernetes/kubernetes/issues/83242
 i=0; while ! kubectl --context ${cluster_name} wait deployments --selector app=nginx-ingress --for condition=available --timeout 0; do test $i -lt 60; sleep 1; i=$((i+1)); done; unset -v i
 kubectl --context hub delete -f examples/helmrepo-hub-channel
 set +e
 kubectl --context ${cluster_name} wait deployments --selector app=nginx-ingress --for delete --timeout 1m
+# error: no matching resources found
 set -e
 cd ..
 
@@ -265,10 +275,15 @@ cd ..
 kubectl --context hub patch managedcluster ${cluster_name} -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
 set +e
 git clone https://github.com/open-cluster-management/application-samples
+# fatal: destination path 'application-samples' already exists and is not an empty directory.
 set -e
 cd application-samples
 set +e
 git apply ../ocm-minikube/application-samples.diff
+# error: patch failed: subscriptions/book-import/placementrule.yaml:9
+# error: subscriptions/book-import/placementrule.yaml: patch does not apply
+# error: patch failed: subscriptions/book-import/subscription.yaml:3
+# error: subscriptions/book-import/subscription.yaml: patch does not apply
 set -e
 kubectl --context hub apply -k subscriptions/channel
 set +e
@@ -286,5 +301,10 @@ kubectl --context hub delete -k subscriptions/book-import
 # Error from server (NotFound): error when deleting "subscriptions/book-import": applications.app.k8s.io "book-import" not found
 set -e
 kubectl --context hub delete -k subscriptions/channel
-kubectl --context ${cluster_name} -n book-import wait pods --all --for delete
+date
+set +e
+kubectl --context ${cluster_name} -n book-import wait pods --all --for delete --timeout 1m
+# error: no matching resources found
+set -e
+date
 unset -v cluster_name
