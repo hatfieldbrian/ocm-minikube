@@ -104,7 +104,7 @@ then
 		cd -
 	fi
 fi
-cd ./registration-operator
+cd registration-operator
 git checkout release-2.3
 # managed cluster names other than cluster1 require
 set +e
@@ -112,21 +112,28 @@ git apply ../ocm-minikube/registration-operator.diff
 set -e
 set +e
 make deploy-hub ${deploy_arguments}
+<<!
+intermittent on start:
+INFO[0014] Created Subscription: cluster-manager-v0-4-0-sub
+FATA[0016] Failed to run packagemanifests: error approving install plan: Operation cannot be fulfilled on installplans.operators.coreos.com "install-h5vdg": the object has been modified; please apply your changes to the latest version and try again
+Makefile:112: recipe for target 'deploy-hub-operator' failed
+make: *** [deploy-hub-operator] Error 1
+
+expected if restart:
+FATA[0000] Failed to run packagemanifests: create catalog: error creating catalog source: catalogsources.operators.coreos.com "cluster-manager-catalog" already exists
+Makefile:112: recipe for target 'deploy-hub-operator' failed
+make: *** [deploy-hub-operator] Error 1
+
+!
 set -e
-cd ../
+cd ..
 date
 kubectl --context hub -n olm                     wait deployments --all --for condition=available --timeout 1m
 date
 kubectl --context hub -n open-cluster-management wait deployments --all --for condition=available
+date
 # https://github.com/kubernetes/kubernetes/issues/83242
-i=0; while
-! kubectl --context hub -n open-cluster-management-hub get deployments/cluster-manager-registration-controller --ignore-not-found=false >/dev/null 2>&1 ||\
-! kubectl --context hub -n open-cluster-management-hub get deployments/cluster-manager-registration-webhook    --ignore-not-found=false >/dev/null 2>&1 ||\
-! kubectl --context hub -n open-cluster-management-hub get deployments/cluster-manager-work-webhook            --ignore-not-found=false >/dev/null 2>&1 &&\
-test $i -lt 90; do sleep 1; i=$((i+1)); done; unset -v i
-date
-kubectl --context hub -n open-cluster-management-hub wait deployments --all --for condition=available --timeout 2m
-date
+i=0; while ! kubectl --context hub -n open-cluster-management-hub wait deployments --all --for condition=available --timeout 0; do test $i -lt 90; sleep 1; i=$((i+1)); done; unset -v i
 
 # managed cluster1 deploy
 minikube start ${minikube_start_options} --profile=cluster1
@@ -137,40 +144,54 @@ kubectl --context hub config view --flatten --minify >/tmp/hub-config
 spoke_add()
 {
 	cluster_name=${1}
-	cd ./registration-operator
+	cd registration-operator
 	export MANAGED_CLUSTER=${cluster_name}
-	#export KUBECONFIG=/tmp/hub-config
 	export HUB_KUBECONFIG=/tmp/hub-config
 	kubectl config use-context ${cluster_name}
 	set +e
 	make deploy-spoke ${deploy_arguments}
+	# FATA[0000] Failed to run packagemanifests: create catalog: error creating catalog source: catalogsources.operators.coreos.com "klusterlet-catalog" already exists
 	set -e
-	cd ../
+	cd ..
 
+	date
 	kubectl --context ${cluster_name} -n open-cluster-management wait deployments --all --for condition=available
 	date
 	# https://github.com/kubernetes/kubernetes/issues/83242
-	i=0; while
-	! kubectl --context ${cluster_name} -n open-cluster-management-agent get deployments/klusterlet-registration-agent --ignore-not-found=false >/dev/null 2>&1 \
-	&& test $i -lt 60; do sleep 1; i=$((i+1)); done; unset -v i
-	#! kubectl --context ${cluster_name} -n open-cluster-management-agent get deployments/klusterlet-work-agent         -oname  >/dev/null 2>&1 &&\
-	kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments/klusterlet-registration-agent --for condition=available
+	i=0; while ! kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments/klusterlet-registration-agent --for condition=available --timeout 0; do test $i -lt 60; sleep 1; i=$((i+1)); done; unset -v i
 
 	# hub register managed cluster
 	set +e
 	kubectl --context hub certificate approve $(kubectl --context hub get csr --field-selector spec.signerName=kubernetes.io/kube-apiserver-client --selector open-cluster-management.io/cluster-name=${cluster_name} -oname)
+	# error: one or more CSRs must be specified as <name> or -f <filename>
 	set -e
-	#kubectl wait csr ${csr_name} --for condition=approved
 	kubectl --context hub patch managedcluster ${cluster_name} -p='{"spec":{"hubAcceptsClient":true}}' --type=merge
+	date
 	kubectl --context hub wait managedcluster/${cluster_name} --for condition=ManagedClusterConditionAvailable
+	date
 	kubectl --context ${cluster_name} -n open-cluster-management-agent wait deployments --all --for condition=available
+	date
 
 	# test
-	sed -e "s,KIND_CLUSTER,${cluster_name}," -i ./ocm-minikube/examples/kustomization.yaml
+	mkdir -p /tmp/ocm-minikube
+	cp -R ocm-minikube/examples /tmp/ocm-minikube
+	sed -e "s,KIND_CLUSTER,${cluster_name}," -i /tmp/ocm-minikube/examples/kustomization.yaml
 	set +e
-	kubectl --context hub apply -k ./ocm-minikube/examples/
+	kubectl --context hub apply -k /tmp/ocm-minikube/examples
 	set -e
-	sed -e "s,${cluster_name},KIND_CLUSTER," -i ./ocm-minikube/examples/kustomization.yaml
+	date
+	kubectl --context ${cluster_name} wait pods/hello --for condition=ready --timeout 90s
+	date
+	# delete may take more than 30 seconds
+	kubectl --context hub delete -k /tmp/ocm-minikube/examples --wait=false
+	date
+	# sed -e "s,${cluster_name},KIND_CLUSTER," -i /tmp/ocm-minikube/examples/kustomization.yaml
+	set +e
+	kubectl --context ${cluster_name} wait pods/hello --for delete --timeout 0
+	# --wait=true  error: no matching resources found
+	# --wait=false error: timed out waiting for the condition on pods/hello
+	set -e
+	date
 	unset -v cluster_name
 }
 spoke_add cluster1
@@ -179,15 +200,17 @@ spoke_add cluster1
 set +e
 git clone https://github.com/open-cluster-management/multicloud-operators-subscription
 set -e
-cd ./multicloud-operators-subscription
+cd multicloud-operators-subscription
 set +e
 git apply ../ocm-minikube/multicloud-operators-subscription.diff
 set -e
 kubectl config use-context hub
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-hub
-cd ../
+cd ..
 
+date
 kubectl --context hub -n multicluster-operators wait deployments --all --for condition=available --timeout 2m
+date
 
 spoke_add_hub()
 {
@@ -199,20 +222,21 @@ unset -v deploy_arguments
 
 # hub managed cluster subscription operator
 export MANAGED_CLUSTER_NAME=hub
-# kubectl config use-context hub
 cd multicloud-operators-subscription
-export HUB_KUBECONFIG=/tmp/hub-config
+# export HUB_KUBECONFIG=/tmp/hub-config
 cp -f ${HUB_KUBECONFIG} /tmp/kubeconfig
-set +e
+kubectl --context hub -n multicluster-operators delete secret appmgr-hub-kubeconfig --ignore-not-found
 kubectl --context hub -n multicluster-operators create secret generic appmgr-hub-kubeconfig --from-file=kubeconfig=/tmp/kubeconfig
-set -e
 mkdir -p munge-manifests
 cp deploy/managed/operator.yaml munge-manifests/operator.yaml
-sed -i 's/<managed cluster name>/'"$MANAGED_CLUSTER_NAME"'/g' munge-manifests/operator.yaml
-sed -i 's/<managed cluster namespace>/'"$MANAGED_CLUSTER_NAME"'/g' munge-manifests/operator.yaml
+sed -i 's/<managed cluster name>/'"${MANAGED_CLUSTER_NAME}"'/g' munge-manifests/operator.yaml
+sed -i 's/<managed cluster namespace>/'"${MANAGED_CLUSTER_NAME}"'/g' munge-manifests/operator.yaml
 sed -i '0,/name: multicluster-operators-subscription/{s/name: multicluster-operators-subscription/name: multicluster-operators-subscription-mc/}' munge-manifests/operator.yaml
+unset -v MANAGED_CLUSTER_NAME
 kubectl --context hub apply -f munge-manifests/operator.yaml
+date
 kubectl --context hub -n multicluster-operators wait deployments --all --for condition=available
+date
 
 cluster_name=cluster1
 # managed cluster subscription operator
@@ -220,14 +244,24 @@ cluster_name=cluster1
 kubectl config use-context ${cluster_name}
 export MANAGED_CLUSTER_NAME=${cluster_name}
 USE_VENDORIZED_BUILD_HARNESS=faked make deploy-community-managed
+unset -v MANAGED_CLUSTER_NAME
+unset -v HUB_KUBECONFIG
+date
 kubectl --context ${cluster_name} -n multicluster-operators wait deployments --all --for condition=available
+date
 
 # test
+kubectl config use-context hub
 kubectl --context hub apply -f examples/helmrepo-hub-channel
-kubectl --context ${cluster_name} wait deployments --all --for condition=available
+# https://github.com/kubernetes/kubernetes/issues/83242
+i=0; while ! kubectl --context ${cluster_name} wait deployments --selector app=nginx-ingress --for condition=available --timeout 0; do test $i -lt 60; sleep 1; i=$((i+1)); done; unset -v i
+kubectl --context hub delete -f examples/helmrepo-hub-channel
+set +e
+kubectl --context ${cluster_name} wait deployments --selector app=nginx-ingress --for delete --timeout 1m
+set -e
 cd ..
 
-#
+# application samples test
 kubectl --context hub patch managedcluster ${cluster_name} -p='{"metadata":{"labels":{"usage":"test"}}}' --type=merge
 set +e
 git clone https://github.com/open-cluster-management/application-samples
@@ -238,12 +272,19 @@ git apply ../ocm-minikube/application-samples.diff
 set -e
 kubectl --context hub apply -k subscriptions/channel
 set +e
-# Error from server (InternalError): error when creating "subscriptions/book-import": Internal error occurred: failed calling webhook "applications.apps.open-cluster-management.webhook": Post "https://multicluster-operators-application-svc.multicluster-operators.svc:443/app-validate?timeout=10s": dial tcp 10.106.210.84:443: connect: connection refused
 kubectl --context hub apply -k subscriptions/book-import
+# Error from server (InternalError): error when creating "subscriptions/book-import": Internal error occurred: failed calling webhook "applications.apps.open-cluster-management.webhook": Post "https://multicluster-operators-application-svc.multicluster-operators.svc:443/app-validate?timeout=10s": dial tcp 10.106.210.84:443: connect: connection refused
+kubectl --context hub apply -f subscriptions/book-import/application.yaml
 # Error from server (InternalError): error when creating "subscriptions/book-import/application.yaml": Internal error occurred: failed calling webhook "applications.apps.open-cluster-management.webhook": Post "https://multicluster-operators-application-svc.multicluster-operators.svc:443/app-validate?timeout=10s": dial tcp 10.106.210.84:443: connect: connection refused
-kubectl --context hub apply -f subscriptions/book-import/application.yaml 
 set -e
 # https://github.com/kubernetes/kubernetes/issues/83242
-i=0; while ! kubectl --context ${cluster_name} -n book-import get deployments --ignore-not-found=false >/dev/null 2>&1 && test $i -lt 30; do sleep 1; i=$((i+1)); done; unset -v i
-kubectl --context ${cluster_name} -n book-import wait deployments --all --for condition=available
+i=0; while ! kubectl --context ${cluster_name} -n book-import wait deployments --all --for condition=available --timeout 0; do test $i -lt 30; sleep 1; i=$((i+1)); done; unset -v i
+set +e
+kubectl --context hub delete -f subscriptions/book-import/application.yaml
+# Error from server (NotFound): error when deleting "subscriptions/book-import/application.yaml": applications.app.k8s.io "book-import" not found
+kubectl --context hub delete -k subscriptions/book-import
+# Error from server (NotFound): error when deleting "subscriptions/book-import": applications.app.k8s.io "book-import" not found
+set -e
+kubectl --context hub delete -k subscriptions/channel
+kubectl --context ${cluster_name} -n book-import wait pods --all --for delete
 unset -v cluster_name
